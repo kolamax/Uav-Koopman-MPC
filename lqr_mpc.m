@@ -1,5 +1,16 @@
+% =============================================================
 % 3D UAV + suspended payload simulation
 % Dual‑mode MPC (LQR terminal cost) tracking a 3D trajectory
+% Author: Alexandre Claux & Maximus Kolavennu
+% ME 569 Project
+%
+% This script:
+% 1. Contains the nonlinear UAV-payload dynamics
+% 2. Uses a warm-start LQR
+% 3. Runs linearized MPC trajectory tracking
+%
+% =============================================================
+
 clear; clc; close all;
 
 %% ============================================================
