@@ -1,0 +1,437 @@
+% =============================================================
+% 3D UAV + suspended payload simulation
+% Dual‑mode MPC (LQR terminal cost) tracking a 3D trajectory
+% Author: Alexandre Claux & Maximus Kolavennu
+% ME 569 Project
+%
+% This script:
+% 1. Contains the nonlinear UAV-payload dynamics
+% 2. Uses a warm-start LQR
+% 3. Runs linearized MPC trajectory tracking
+%
+% =============================================================
+
+clear; clc; close all;
+
+%% ============================================================
+%                     System Parameters
+% =============================================================
+M    = 1.5;       % UAV mass [kg]
+m    = 0.3;       % payload mass [kg]
+l    = 0.75;      % cable length [m]
+g    = 9.81;      % gravity [m/s^2]
+
+% Control limits (direct forces in X, Y, Z)
+F_max = 50;       % max force [N] in any direction
+F_min = -50;
+
+%% ============================================================
+%                Simulation configuration
+% =============================================================
+t0         = 0;
+tf         = 60;          % simulation time [s]
+dt_control = 0.05;        % controller update period [s]
+
+% Initial state: [x; xdot; y; ydot; z; zdot; theta_x; thetadot_x; theta_y; thetadot_y]
+x0 = [0; 0; 0; 0; 1.0; 0; 0.05; 0; 0.03; 0];
+
+%% ============================================================
+%           Desired 3D Trajectory (time‑varying)
+% =============================================================
+% Horizontal circular motion: x = A*sin(2π f t), y = A*cos(2π f t)
+A_horiz = 1.5;      % radius [m]
+f_horiz = 0.1;      % frequency [Hz] -> period 10 s
+
+% Altitude linear ramp
+z0   = 1.0;         % initial altitude [m]
+slope = 0.02;       % slope [m/s] -> from 1 m to 2.2 m over 60 s
+
+% Reference function: returns full state vector [10x1] at time t
+x_ref_fun = @(t) compute_reference_3D(t, A_horiz, f_horiz, z0, slope);
+
+%% ============================================================
+%                     MPC & LQR Weights
+% =============================================================
+% States order: x, xdot, y, ydot, z, zdot, theta_x, thetadot_x, theta_y, thetadot_y
+Q = diag([200,  20, ...    % x, xdot
+          200,  20, ...    % y, ydot
+          200,  20, ...    % z, zdot
+         3000, 600, ...    % theta_x, thetadot_x (strong damping)
+         3000, 600]);      % theta_y, thetadot_y
+
+R = 2 * diag([10, 10, 10]);   % Fx, Fy, Fz
+
+% MPC horizon
+N = 30;
+
+%% ============================================================
+%           LQR Design (fixed linearisation at hover)
+% =============================================================
+% Hover equilibrium state and input
+x_hover = zeros(10,1);
+u_hover = [0; 0; (M)*g];   % Fz = (M+m)g to hover 
+% Linearise continuous-time dynamics at hover
+[A_hover, B_hover] = linearize_fd_3D(0, x_hover, u_hover);
+
+% Discretise with the same sample time
+Ad_hover = expm(A_hover * dt_control);
+Bd_hover = B_hover * dt_control;
+
+% Solve discrete-time algebraic Riccati equation
+try
+    [K_lqr, P, ~] = dlqr(Ad_hover, Bd_hover, Q, R);
+catch
+    error('dlqr requires Control System Toolbox.');
+end
+
+fprintf('LQR gain K computed (size %dx%d)\n', size(K_lqr,1), size(K_lqr,2));
+
+%% ============================================================
+%              Logging and ODE settings
+% =============================================================
+tlog = [];
+xlog = [];
+ulog = [];
+
+odeopts = odeset('RelTol',1e-6,'AbsTol',1e-8);
+
+x     = x0;
+t_sim = t0;
+
+%% ============================================================
+%                Main Simulation Loop (LQR+MPC)
+% =============================================================
+while t_sim < tf - 1e-9
+
+    % Linearise about current state (for prediction model)
+    u_nom = u_hover;   % nominal hover force
+    x_nom = x_ref_fun(t_sim);
+    [A, B] = linearize_fd_3D(t_sim, x_nom, u_nom);
+
+    t_next = min(t_sim + dt_control, tf);
+
+    % Compute MPC control with time‑varying reference
+    u_mpc = mpc_control_lqr_3D(x, t_sim, x_ref_fun, A, B, Q, R, P, K_lqr, ...
+                               N, dt_control, F_min, F_max);
+
+    % Control law: hold u constant over this interval
+    u_fun = @(t_local, x_local) u_mpc;
+
+    % Saturated dynamics wrapper
+    dyn_wrap = @(tt, xx) dynamics_3D(tt, xx, saturate_u_3D(u_fun(tt,xx), F_min, F_max));
+
+    % Integrate nonlinear dynamics
+    [Tstep, Xstep] = ode45(dyn_wrap, [t_sim t_next], x, odeopts);
+
+    % Log states
+    tlog = [tlog; Tstep];
+    xlog = [xlog; Xstep];
+
+    % Log controls (piecewise constant)
+    for k = 1:size(Xstep,1)
+        ulog = [ulog; u_mpc.'];
+    end
+
+    % Update for next loop
+    x     = Xstep(end,:).';
+    t_sim = t_next;
+end
+
+%% ============================================================
+%                        3D Plotting
+% =============================================================
+T = tlog;
+X = xlog;
+U = ulog;
+
+% Compute reference for plotting
+T_ref = linspace(t0, tf, 1000)';
+
+vx = 0.5;
+
+Xref = vx * T_ref;
+Yref = A_horiz * sin(2*pi*f_horiz*T_ref);
+Zref = z0 + slope * T_ref;
+
+% Figure 1: 3D trajectory
+figure(1);
+plot3(X(:,1), X(:,3), X(:,5), 'b-', 'LineWidth', 1.5); hold on;
+plot3(Xref, Yref, Zref, 'r--', 'LineWidth', 1.2);
+xlabel('X [m]'); ylabel('Y [m]'); zlabel('Z [m]');
+title('3D trajectory of UAV (X,Y,Z)');
+legend('Actual', 'Reference');
+grid on; view(45, 30);
+
+% Figure 2: Time series of X, Y, Z
+figure(2);
+subplot(3,1,1);
+plot(T, X(:,1), 'b-', T_ref, Xref, 'r--');
+ylabel('X [m]'); legend('x','x_{ref}'); grid on;
+subplot(3,1,2);
+plot(T, X(:,3), 'b-', T_ref, Yref, 'r--');
+ylabel('Y [m]'); legend('y','y_{ref}'); grid on;
+subplot(3,1,3);
+plot(T, X(:,5), 'b-', T_ref, Zref, 'r--');
+ylabel('Z [m]'); xlabel('Time [s]'); legend('z','z_{ref}'); grid on;
+sgtitle('UAV position vs time');
+
+% Figure 3: Payload swing angles
+figure(3);
+subplot(2,1,1);
+plot(T, X(:,7), 'LineWidth', 1.3);
+ylabel('$\theta_x$ [rad]', 'interpreter', 'latex'); grid on;
+title('Payload swing in X-Z plane');
+subplot(2,1,2);
+plot(T, X(:,9), 'LineWidth', 1.3);
+ylabel('$\theta_y$ [rad]', 'interpreter', 'latex'); xlabel('Time [s]'); grid on;
+title('Payload swing in Y-Z plane');
+sgtitle('Suspended payload angles');
+
+% Figure 4: Control inputs
+figure(4);
+subplot(3,1,1);
+plot(T, U(:,1), 'LineWidth', 1.3);
+ylabel('$F_x$ [N]'); title('Force X'); grid on;
+subplot(3,1,2);
+plot(T, U(:,2), 'LineWidth', 1.3);
+ylabel('$F_y$ [N]'); title('Force Y'); grid on;
+subplot(3,1,3);
+plot(T, U(:,3), 'LineWidth', 1.3);
+ylabel('$F_z$ [N]'); xlabel('Time [s]'); title('Force Z'); grid on;
+sgtitle('Control inputs');
+
+fprintf('Final position error: [%.3f, %.3f, %.3f]\n', ...
+        abs(X(end,1)-Xref(end)), abs(X(end,3)-Yref(end)), abs(X(end,5)-Zref(end)));
+
+save('uav_payload_3D_lqr_mpc.mat','T','X','U');
+
+%% ============================================================
+%          Helper: reference state for 3D trajectory
+% =============================================================
+function x_ref = compute_reference_3D(t, A, f, z0, slope)
+
+    vx = 0.5;   % forward speed [m/s]
+
+    % Position
+    x_r = vx * t;
+    y_r = A * sin(2*pi*f*t);
+    z_r = z0 + slope * t;
+
+    % Velocity
+    xdot_r = vx;
+    ydot_r = A * 2*pi*f * cos(2*pi*f*t);
+    zdot_r = slope;
+
+    % Swing references
+    theta_x_r = 0;
+    thetadot_x_r = 0;
+
+    theta_y_r = 0;
+    thetadot_y_r = 0;
+
+    x_ref = [x_r; xdot_r;
+             y_r; ydot_r;
+             z_r; zdot_r;
+             theta_x_r; thetadot_x_r;
+             theta_y_r; thetadot_y_r];
+end
+
+%% ============================================================
+%         3D Dynamics (mass‑matrix formulation)
+% =============================================================
+function dx = dynamics_3D(t, x, u)
+    M = 1.5; m = 0.3; l = 0.75; g = 9.81;
+    
+    % Extract states
+    xpos = x(1); xdot = x(2);
+    ypos = x(3); ydot = x(4);
+    zpos = x(5); zdot = x(6);
+    thx  = x(7); thx_dot = x(8);
+    thy  = x(9); thy_dot = x(10);
+    
+    % Forces from controller
+    Fx = u(1); Fy = u(2); Fz = u(3);
+
+    % Wind disturbance forces
+    Fx_wind = 1.0 * sin(0.4*t);
+    Fy_wind = 0.8 * cos(0.25*t);
+    Fz_wind = 0.5 * sin(0.7*t);
+    
+    % Mass matrix (for x,y,z,thx,thy)
+    % Derived from Lagrangian (see notes)
+    Mmat = zeros(5,5);
+    Mmat(1,1) = M + m;
+    Mmat(1,4) = m*l*cos(thx)*cos(thy);
+    Mmat(2,2) = M + m;
+    Mmat(2,5) = m*l*cos(thy);  % simplified, cos(thx)~1 for small thx
+    Mmat(3,3) = M + m;
+    Mmat(3,4) = -m*l*sin(thx)*cos(thy);
+    Mmat(3,5) = -m*l*cos(thx)*sin(thy);
+    Mmat(4,1) = Mmat(1,4);
+    Mmat(4,3) = Mmat(3,4);
+    Mmat(4,4) = m*l^2;
+    Mmat(4,5) = 0;
+    Mmat(5,2) = Mmat(2,5);
+    Mmat(5,3) = Mmat(3,5);
+    Mmat(5,4) = 0;
+    Mmat(5,5) = m*l^2*cos(thx)^2;
+    
+    % Right-hand side (Coriolis, gravity, forces)
+    rhs = zeros(5,1);
+    rhs(1) = Fx + Fx_wind + m*l*(thx_dot^2*sin(thx)*cos(thy) + 2*thx_dot*thy_dot*cos(thx)*sin(thy) + thy_dot^2*sin(thx)*cos(thy));
+    rhs(2) = Fy + Fy_wind + m*l*(thy_dot^2*sin(thy) + thx_dot^2*cos(thx)^2*sin(thy) + 2*thx_dot*thy_dot*cos(thx)*sin(thx)*cos(thy));
+    rhs(3) = Fz +Fz_wind - (M+m)*g + m*l*(thx_dot^2*cos(thx)*cos(thy) + 2*thx_dot*thy_dot*sin(thx)*sin(thy) + thy_dot^2*cos(thx)*cos(thy));
+    rhs(4) = -m*g*l*sin(thx)*cos(thy);
+    rhs(5) = -m*g*l*cos(thx)*sin(thy);
+    
+    % Solve for accelerations
+    acc = Mmat \ rhs;
+    
+    xdd = acc(1);
+    ydd = acc(2);
+    zdd = acc(3);
+    thx_dd = acc(4);
+    thy_dd = acc(5);
+    
+    dx = [xdot; xdd; ydot; ydd; zdot; zdd; thx_dot; thx_dd; thy_dot; thy_dd];
+end
+
+%% ============================================================
+%         Linearisation (finite difference) for 3D
+% =============================================================
+function [A, B] = linearize_fd_3D(t, x, u)
+    n = length(x);
+    m = length(u);
+    fx = dynamics_3D(t, x, u);
+    eps = 1e-4;
+    A = zeros(n,n);
+    B = zeros(n,m);
+    for i = 1:n
+        xp = x; xp(i) = xp(i) + eps;
+        fp = dynamics_3D(t, xp, u);
+        A(:,i) = (fp - fx)/eps;
+    end
+    for j = 1:m
+        up = u; up(j) = up(j) + eps;
+        fp = dynamics_3D(t, x, up);
+        B(:,j) = (fp - fx)/eps;
+    end
+end
+
+%% ============================================================
+%                 Input Saturation (3D)
+% =============================================================
+function u_sat = saturate_u_3D(u, F_min, F_max)
+    u_sat = max(min(u, F_max), F_min);
+end
+
+%% ============================================================
+%         MPC with LQR terminal cost (3D, time‑varying)
+% =============================================================
+function u0 = mpc_control_lqr_3D(x, t_cur, x_ref_fun, A, B, Q, R, P, K_lqr, ...
+                                 N, dt, u_min, u_max)
+    nx = size(A,1);
+    nu = size(B,2);
+    sysc = ss(A, B, [], []);
+    sysd = c2d(sysc, dt);
+    
+    Ad = sysd.A;
+    Bd = sysd.B;
+    [Sx, Su] = build_prediction_matrices(Ad, Bd, N);
+    
+    % Build reference over horizon
+    Xref = zeros(N*nx,1);
+    for k = 0:N-1
+        t_k = t_cur + k*dt;
+        x_ref_k = x_ref_fun(t_k);
+        Xref(k*nx+1:(k+1)*nx) = x_ref_k;
+    end
+    
+    Qbar = blkdiag(kron(eye(N-1), Q), P);
+    Rbar = kron(eye(N), R);
+    H = Su' * Qbar * Su + Rbar;
+    H = 0.5*(H + H');
+    f = Su' * Qbar * (Sx * x - Xref);
+    
+    % Build proper box constraints (vector for each input)
+    lb = u_min * ones(nu, 1);
+    ub = u_max * ones(nu, 1);
+    Umin = repmat(lb, N, 1);
+    Umax = repmat(ub, N, 1);
+    
+    % Warm-start with LQR
+    U0 = zeros(N*nu,1);
+    x_pred = x;
+    for i = 1:N
+        t_pred = t_cur + (i-1)*dt;
+        x_ref_pred = x_ref_fun(t_pred);
+        
+        du_lqr = -K_lqr * (x_pred - x_ref_pred);
+        du_lqr = max(min(du_lqr, ub), lb);   % use ub, lb (vectors)
+        U0((i-1)*nu+1:i*nu) = du_lqr;
+        
+        x_pred = Ad*x_pred + Bd*du_lqr;
+    end
+    
+    Uopt = projected_gradient_qp(H, f, Umin, Umax, U0);
+    du0 = Uopt(1:nu);
+
+    u_hover = [0;0;(1.5+0.3)*9.81];
+    
+    u0 = u_hover + du0;
+end
+
+%% ============================================================
+%          Build Prediction Matrices
+% =============================================================
+function [Sx, Su] = build_prediction_matrices(Ad, Bd, N)
+
+    nx = size(Ad,1);
+    nu = size(Bd,2);
+
+    Sx = zeros(N*nx, nx);
+    Su = zeros(N*nx, N*nu);
+
+    Apowers = cell(N,1);
+
+    Apowers{1} = Ad;
+
+    for k = 2:N
+        Apowers{k} = Apowers{k-1} * Ad;
+    end
+
+    for i = 1:N
+
+        Sx((i-1)*nx+1:i*nx,:) = Apowers{i};
+
+        for j = 1:i
+
+            if i == j
+                Atemp = eye(nx);
+            else
+                Atemp = Apowers{i-j};
+            end
+
+            Su((i-1)*nx+1:i*nx, ...
+               (j-1)*nu+1:j*nu) = Atemp * Bd;
+        end
+    end
+end
+
+%% ============================================================
+%        Simple Projected Gradient Solver for Box-QP
+% =============================================================
+function U = projected_gradient_qp(H, f, Umin, Umax, U0)
+    max_iter = 200;
+    if norm(H, 'fro') > 0
+        alpha = 0.95 / norm(H,2);
+    else
+        alpha = 1e-3;
+    end
+    U = U0;
+    for k = 1:max_iter
+        grad = H*U + f;
+        U = U - alpha * grad;
+        U = min(max(U, Umin), Umax);
+    end
+end
