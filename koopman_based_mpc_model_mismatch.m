@@ -620,3 +620,21 @@ for k = 1:max_iter
 end
 
 end
+
+%% ============================================================
+%                   SAVE EXPERIMENT DATA
+% ============================================================
+data.T = T;
+data.X = X;
+data.U = U;
+
+data.params.M = M;
+data.params.m = m;
+data.params.l = l;
+data.params.g = g;
+
+
+data.meta.N = N;
+data.meta.model = "KOOPMAN_MISMATCH";
+
+save('exp_koopman_mismatch.mat', 'data');
