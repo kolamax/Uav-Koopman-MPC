@@ -435,3 +435,22 @@ function U = projected_gradient_qp(H, f, Umin, Umax, U0)
         U = min(max(U, Umin), Umax);
     end
 end
+
+%% ============================================================
+%                   SAVE EXPERIMENT DATA
+% ============================================================
+data.T = T;
+data.X = X;
+data.U = U;
+
+data.x_ref_fun = x_ref_fun;
+data.params.M = M;
+data.params.m = m;
+data.params.l = l;
+data.params.g = g;
+
+data.meta.dt_control = dt_control;
+data.meta.N = N;
+data.meta.model = "LQR_WIND";
+
+save('exp_lqr_wind.mat', 'data');
